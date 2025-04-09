@@ -1,5 +1,5 @@
 # efibootlst
-List all UEFI Boot entries
+### List all UEFI Boot entries
 
 Compile: (needs efivar devel package)
 ```bash
@@ -9,7 +9,7 @@ Run:
 ```bash
 ./efibootlst
 ```
-There is a compiled binary for Linux x86_64 (efibootlst)
+**There is a compiled binary for Linux x86_64 (efibootlst)**
 
 
 Example output:(I only have one boot entry)
