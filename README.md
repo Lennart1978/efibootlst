@@ -3,7 +3,7 @@ List all UEFI Boot entries
 
 Compile: (needs efivar devel package)
 ```bash
-gcc -s -O3 efibootlst -o efibootlst -lefivar
+gcc -s -O3 efibootlst.c -o efibootlst -lefivar
 ```
 Run:
 ```bash
