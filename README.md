@@ -32,6 +32,6 @@ a3 1f bf 79 d8 bc 4c 7b 02 02 04 04 46 00 5c 00
 45 00 4d 00 44 00 2d 00 42 00 4f 00 4f 00 54 00 
 58 00 36 00 34 00 2e 00 45 00 46 00 49 00 00 00 
 7f ff 04 00 
-  Parsed: HD(...)/\EFI\SYSTEMD\SYSTEMD-BOOTX64.EFI/End(Entire)
+Parsed: HD(Part=1,SigType=2,Sig=ef1f48f8-0f82-4924-a31f-bf79d8bc4c7b,Format=GPT)/File(\EFI\SYSTEMD\SYSTEMD-BOOTX64.EFI)/End(Entire)
 ```
 
