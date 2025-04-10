@@ -5,7 +5,9 @@
 #include <efivar/efivar.h>
 #include <wchar.h>
 #include <locale.h>
-#include <stdint.h> // For explicit integer types
+#include <stdint.h>   // For explicit integer types
+#include <inttypes.h> // For PRIu64 used in NVMe printing
+#include <stddef.h>   // For offsetof
 
 // GUID for EFI Global Variable
 static efi_guid_t global = EFI_GLOBAL_GUID;
@@ -63,16 +65,119 @@ static efi_guid_t global = EFI_GLOBAL_GUID;
 #define MSG_DNS_DP 0x1F
 // --- End Device Path Types and Subtypes ---
 
-// --- utf16le_to_utf8 function (unchanged, with note about static buffer) ---
-// WARNING: Uses a static buffer. Not thread-safe and limited length.
+// --- Base Device Path Structure Header ---
+// MUST be defined before structures that use it.
+typedef struct __attribute__((packed))
+{
+    uint8_t Type;
+    uint8_t SubType;
+    uint16_t Length;
+} EFI_DEVICE_PATH_PROTOCOL_HEADER;
+
+// --- Device Path Structures ---
+// Refer to UEFI Specification 2.10, Section 10.3 Device Path Nodes.
+
+typedef struct __attribute__((packed))
+{
+    EFI_DEVICE_PATH_PROTOCOL_HEADER Header;
+    uint32_t PartitionNumber;
+    uint64_t PartitionStart;
+    uint64_t PartitionSize;
+    uint8_t Signature[16]; // GUID or MBR Signature
+    uint8_t MBRType;       // Partition Format (GPT/MBR)
+    uint8_t SignatureType; // Signature Type (GUID/MBR)
+} HARD_DRIVE_DEVICE_PATH;
+
+#define MBR_TYPE_PCAT 0x01
+#define MBR_TYPE_EFI_PARTITION_TABLE_HEADER 0x02
+
+#define SIGNATURE_TYPE_MBR 0x01
+#define SIGNATURE_TYPE_GUID 0x02
+
+typedef struct __attribute__((packed))
+{
+    EFI_DEVICE_PATH_PROTOCOL_HEADER Header;
+    uint16_t HBAPortNumber;
+    uint16_t PortMultiplierPortNumber;
+    uint16_t Lun; // Logical Unit Number
+} SATA_DEVICE_PATH;
+
+typedef struct __attribute__((packed))
+{
+    EFI_DEVICE_PATH_PROTOCOL_HEADER Header;
+    uint32_t NamespaceId;
+    uint64_t NamespaceUuid; // Actually IEEE EUI-64 identifier, not UUID
+} NVME_NAMESPACE_DEVICE_PATH;
+
+typedef struct __attribute__((packed))
+{
+    EFI_DEVICE_PATH_PROTOCOL_HEADER Header;
+    uint8_t ParentPortNumber;
+    uint8_t InterfaceNumber;
+} USB_DEVICE_PATH;
+
+// Used for both ACPI_DEVICE_PATH Subtype 0x01 (PNP) and 0x02 (HID)
+// For Subtype 0x01, CID is assumed 0 or ignored.
+// For Subtype 0x02, UID might be optional based on length.
+typedef struct __attribute__((packed))
+{
+    EFI_DEVICE_PATH_PROTOCOL_HEADER Header;
+    uint32_t HID;       // Hardware ID (EISA ID Format for PNP) or HID
+    uint32_t UID;       // Unique ID (if present, usually 0 for PNP)
+    uint32_t CID;       // Compatible ID (for HID, if present)
+} ACPI_HID_DEVICE_PATH; // Naming reflects the structure containing HID/UID/CID
+
+// --- End Device Path Structures ---
+
+// --- utf16le_to_utf8 function ---
+// Converts a UTF-16LE string to a dynamically allocated UTF-8 string.
+// Returns NULL on error (e.g., allocation failure).
+// The caller is responsible for freeing the returned string.
 char *utf16le_to_utf8(const uint16_t *utf16_str, size_t max_len_bytes)
 {
-    static char utf8_buf[1024];            // Static buffer!
-    memset(utf8_buf, 0, sizeof(utf8_buf)); // Clear buffer
-    size_t i_bytes = 0, j = 0;
+    // Estimate initial buffer size (can be refined)
+    // Worst case: 4 bytes UTF-8 per UTF-16 char + null terminator
+    size_t initial_buf_size = (max_len_bytes / sizeof(uint16_t)) * 4 + 1;
+    if (initial_buf_size < 128)
+        initial_buf_size = 128; // Minimum size
 
-    while (i_bytes + sizeof(uint16_t) <= max_len_bytes && j < sizeof(utf8_buf) - 4)
+    char *utf8_buf = malloc(initial_buf_size);
+    if (!utf8_buf)
     {
+        perror("Failed to allocate memory for UTF-8 conversion");
+        return NULL;
+    }
+    size_t buf_size = initial_buf_size;
+    // No need to memset to 0 if we correctly null-terminate at the end
+
+    size_t i_bytes = 0; // Input byte index
+    size_t j = 0;       // Output byte index (UTF-8 buffer)
+
+    while (i_bytes + sizeof(uint16_t) <= max_len_bytes)
+    {
+        // Check if buffer needs resizing (leave space for worst-case: 4 bytes + null)
+        if (j + 5 >= buf_size)
+        {
+            size_t new_size = buf_size * 2;
+            // Prevent potential integer overflow for very large strings
+            if (new_size < buf_size)
+            {
+                fprintf(stderr, "Error: Buffer size overflow during UTF-8 conversion.\n");
+                free(utf8_buf);
+                return NULL;
+            }
+            char *new_buf = realloc(utf8_buf, new_size);
+            if (!new_buf)
+            {
+                perror("Failed to reallocate memory for UTF-8 conversion");
+                free(utf8_buf);
+                return NULL;
+            }
+            utf8_buf = new_buf;
+            buf_size = new_size;
+            // Note: The newly allocated part is not zeroed by realloc
+        }
+
         uint16_t c;
         memcpy(&c, (const uint8_t *)utf16_str + i_bytes, sizeof(uint16_t));
         i_bytes += sizeof(uint16_t);
@@ -86,8 +191,7 @@ char *utf16le_to_utf8(const uint16_t *utf16_str, size_t max_len_bytes)
         }
         else if (c < 0x800)
         {
-            if (j + 1 >= sizeof(utf8_buf) - 1)
-                break;
+            // Need 2 bytes
             utf8_buf[j++] = 0xC0 | (c >> 6);
             utf8_buf[j++] = 0x80 | (c & 0x3F);
         }
@@ -99,8 +203,7 @@ char *utf16le_to_utf8(const uint16_t *utf16_str, size_t max_len_bytes)
                 memcpy(&c2, (const uint8_t *)utf16_str + i_bytes, sizeof(uint16_t));
                 if (c2 >= 0xDC00 && c2 <= 0xDFFF)
                 { // Low Surrogate
-                    if (j + 3 >= sizeof(utf8_buf) - 1)
-                        break;
+                    // Need 4 bytes
                     uint32_t code_point = 0x10000 + (((c & 0x3FF) << 10) | (c2 & 0x3FF));
                     utf8_buf[j++] = 0xF0 | (code_point >> 18);
                     utf8_buf[j++] = 0x80 | ((code_point >> 12) & 0x3F);
@@ -110,46 +213,55 @@ char *utf16le_to_utf8(const uint16_t *utf16_str, size_t max_len_bytes)
                 }
                 else
                 { // High surrogate without Low surrogate -> Error
-                    if (j >= sizeof(utf8_buf) - 1)
-                        break;
                     utf8_buf[j++] = '?';
                 }
             }
             else
             { // End of data after High Surrogate
-                if (j >= sizeof(utf8_buf) - 1)
-                    break;
                 utf8_buf[j++] = '?';
                 break;
             }
         }
         else if (c >= 0xDC00 && c <= 0xDFFF)
         { // Low surrogate without High surrogate -> Error
-            if (j >= sizeof(utf8_buf) - 1)
-                break;
             utf8_buf[j++] = '?';
         }
         else
         { // Normal 3-byte UTF-8 character
-            if (j + 2 >= sizeof(utf8_buf) - 1)
-                break;
+            // Need 3 bytes
             utf8_buf[j++] = 0xE0 | (c >> 12);
             utf8_buf[j++] = 0x80 | ((c >> 6) & 0x3F);
             utf8_buf[j++] = 0x80 | (c & 0x3F);
         }
     }
     utf8_buf[j] = '\0'; // Ensure the string is null-terminated
-    return utf8_buf;
+
+    // Optional: Shrink buffer to actual size (trade-off: extra realloc vs memory saving)
+    // Consider adding this if memory usage is critical
+    /*
+    char *final_buf = realloc(utf8_buf, j + 1);
+    if (!final_buf) {
+         // If shrinking fails, return the larger buffer, it's still valid
+         perror("Warning: Failed to shrink buffer during UTF-8 conversion");
+         return utf8_buf;
+     }
+    return final_buf;
+    */
+
+    return utf8_buf; // Return potentially oversized buffer
 }
 // --- End utf16le_to_utf8 function ---
 
-// Structure for the header of a Device Path node
-typedef struct __attribute__((packed))
+// Helper function to print GUID from raw bytes
+void print_guid_from_bytes(const uint8_t *guid_bytes)
 {
-    uint8_t Type;
-    uint8_t SubType;
-    uint16_t Length;
-} EFI_DEVICE_PATH_PROTOCOL_HEADER;
+    printf("%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+           guid_bytes[3], guid_bytes[2], guid_bytes[1], guid_bytes[0],                                      // Data1 (LE)
+           guid_bytes[5], guid_bytes[4],                                                                    // Data2 (LE)
+           guid_bytes[7], guid_bytes[6],                                                                    // Data3 (LE)
+           guid_bytes[8], guid_bytes[9],                                                                    // Data4[0..1]
+           guid_bytes[10], guid_bytes[11], guid_bytes[12], guid_bytes[13], guid_bytes[14], guid_bytes[15]); // Data4[2..7]
+}
 
 // Debug output of raw data
 void debug_print_raw_data(const uint8_t *data, size_t size)
@@ -183,7 +295,7 @@ void print_device_path(const uint8_t *path_data, size_t path_size)
     int error_count = 0;
     const int MAX_ERRORS = 3;
 
-    printf("  Parsed: "); // Label for parsed output
+    printf("Parsed: "); // Label for parsed output
 
     while (offset < path_size && error_count < MAX_ERRORS)
     {
@@ -217,6 +329,10 @@ void print_device_path(const uint8_t *path_data, size_t path_size)
             // Break on invalid length
             break;
         }
+
+        const uint8_t *node_data_start = path_data + offset;
+        const uint8_t *payload_start = node_data_start + sizeof(EFI_DEVICE_PATH_PROTOCOL_HEADER);
+        size_t payload_size = header.Length - sizeof(EFI_DEVICE_PATH_PROTOCOL_HEADER);
 
         // Check for end node (can be anywhere but must be at the end)
         if (header.Type == END_DEVICE_PATH_TYPE)
@@ -256,26 +372,78 @@ void print_device_path(const uint8_t *path_data, size_t path_size)
                 {
                 case MEDIA_FILEPATH_DP:
                 {
-                    // Data starts after header
-                    const uint8_t *filepath_data = path_data + offset + sizeof(EFI_DEVICE_PATH_PROTOCOL_HEADER);
-                    // Payload length = total node length - header length
-                    size_t filepath_bytes = header.Length - sizeof(EFI_DEVICE_PATH_PROTOCOL_HEADER);
-
-                    // Note: utf16le_to_utf8 expects max_len_bytes, not character count
-                    printf("%s", utf16le_to_utf8((const uint16_t *)filepath_data, filepath_bytes));
+                    // Data starts after header - payload_start already points here
+                    // Payload length = payload_size
+                    if (payload_size > 0)
+                    {
+                        // Note: utf16le_to_utf8 expects max_len_bytes, not character count
+                        char *utf8_str = utf16le_to_utf8((const uint16_t *)payload_start, payload_size);
+                        if (utf8_str)
+                        {
+                            printf("File(%s)", utf8_str); // Changed prefix for clarity
+                            free(utf8_str);
+                        }
+                        else
+                        {
+                            printf("File(Error converting path)");
+                        }
+                    }
+                    else
+                    {
+                        printf("File(Empty Path)");
+                    }
                     break;
                 }
                 case MEDIA_HARDDRIVE_DP:
-                    printf("HD(...)");
+                    if (header.Length >= sizeof(HARD_DRIVE_DEVICE_PATH))
+                    {
+                        HARD_DRIVE_DEVICE_PATH hd_data;
+                        memcpy(&hd_data, node_data_start, sizeof(HARD_DRIVE_DEVICE_PATH)); // Copy entire struct including header
+                        printf("HD(Part=%u,SigType=%u,", hd_data.PartitionNumber, hd_data.SignatureType);
+                        if (hd_data.SignatureType == SIGNATURE_TYPE_GUID)
+                        {
+                            printf("Sig=");
+                            // Directly use the bytes from the structure
+                            print_guid_from_bytes(hd_data.Signature);
+                        }
+                        else if (hd_data.SignatureType == SIGNATURE_TYPE_MBR)
+                        {
+                            printf("Sig=%02x%02x%02x%02x", hd_data.Signature[0], hd_data.Signature[1], hd_data.Signature[2], hd_data.Signature[3]);
+                        }
+                        else
+                        {
+                            printf("Sig=Unknown");
+                        }
+                        printf(",Format=%s)", hd_data.MBRType == MBR_TYPE_PCAT ? "MBR" : (hd_data.MBRType == MBR_TYPE_EFI_PARTITION_TABLE_HEADER ? "GPT" : "Unknown"));
+                    }
+                    else
+                    {
+                        printf("HD(Data too short)");
+                    }
                     break;
                 case MEDIA_CDROM_DP:
+                    // Could parse BootEntry and other fields if needed
                     printf("CDROM(...)");
                     break;
                 case MEDIA_VENDOR_DP:
+                    // Vendor GUID would be in payload_start
                     printf("MediaVendor(...)");
                     break;
                 case MEDIA_PROTOCOL_DP:
-                    printf("MediaProto(...)");
+                    // Protocol GUID would be in payload_start
+                    if (payload_size >= sizeof(efi_guid_t))
+                    {
+                        // We don't have efi_guid_t readily available here, print raw bytes
+                        // efi_guid_t proto_guid;
+                        // memcpy(&proto_guid, payload_start, sizeof(efi_guid_t));
+                        printf("MediaProto(GUID=");
+                        print_guid_from_bytes(payload_start);
+                        printf(")");
+                    }
+                    else
+                    {
+                        printf("MediaProto(Invalid GUID size)");
+                    }
                     break;
                 default:
                     printf("Media(SubType=0x%02x)", header.SubType);
@@ -284,38 +452,169 @@ void print_device_path(const uint8_t *path_data, size_t path_size)
                 break;
 
             case HARDWARE_DEVICE_PATH:
+                // Example: PCI - would require PCI_DEVICE_PATH struct
                 printf("Hw(SubType=0x%02x)", header.SubType);
                 break;
 
             case ACPI_DEVICE_PATH:
                 if (header.SubType == 0x01)
-                    printf("Acpi(PNP...)");
+                { // ACPI_DEVICE_PATH_SUBTYPE
+                    // Check if length allows reading HID and potentially UID
+                    if (header.Length >= offsetof(ACPI_HID_DEVICE_PATH, UID) + sizeof(uint32_t))
+                    {
+                        ACPI_HID_DEVICE_PATH acpi_data;
+                        memcpy(&acpi_data, node_data_start, offsetof(ACPI_HID_DEVICE_PATH, UID) + sizeof(uint32_t)); // Read HID and UID
+                        // EISA ID conversion: (HI << 16) | LO -> "PNPxxxx" or "ABCxxxx"
+                        char pnp[8];
+                        uint32_t hid = acpi_data.HID;
+                        sprintf(pnp, "%c%c%c%04X",
+                                ((hid >> 10) & 0x1F) + 'A' - 1,
+                                ((hid >> 5) & 0x1F) + 'A' - 1,
+                                (hid & 0x1F) + 'A' - 1,
+                                (hid >> 16) & 0xFFFF);
+                        if (acpi_data.UID != 0)
+                        {
+                            printf("Acpi(PNP=%s,UID=%u)", pnp, acpi_data.UID);
+                        }
+                        else
+                        {
+                            printf("Acpi(PNP=%s)", pnp);
+                        }
+                    }
+                    else if (header.Length >= offsetof(ACPI_HID_DEVICE_PATH, UID))
+                    {
+                        ACPI_HID_DEVICE_PATH acpi_data;
+                        memcpy(&acpi_data, node_data_start, offsetof(ACPI_HID_DEVICE_PATH, UID)); // Read only HID
+                        char pnp[8];
+                        uint32_t hid = acpi_data.HID;
+                        sprintf(pnp, "%c%c%c%04X",
+                                ((hid >> 10) & 0x1F) + 'A' - 1,
+                                ((hid >> 5) & 0x1F) + 'A' - 1,
+                                (hid & 0x1F) + 'A' - 1,
+                                (hid >> 16) & 0xFFFF);
+                        printf("Acpi(PNP=%s)", pnp);
+                    }
+                    else
+                    {
+                        printf("Acpi(PNP Data too short)");
+                    }
+                }
                 else if (header.SubType == 0x02)
-                    printf("Acpi(HID...)");
+                { // ACPI_EXTENDED_DP
+                    // Check length for HID, UID, CID
+                    if (header.Length >= sizeof(ACPI_HID_DEVICE_PATH))
+                    {
+                        ACPI_HID_DEVICE_PATH acpi_data;
+                        memcpy(&acpi_data, node_data_start, sizeof(ACPI_HID_DEVICE_PATH));
+                        // Format depends on HID type (PNP or other)
+                        printf("AcpiEx(HID=0x%x,UID=%u,CID=0x%x)", acpi_data.HID, acpi_data.UID, acpi_data.CID);
+                    }
+                    else if (header.Length >= offsetof(ACPI_HID_DEVICE_PATH, CID))
+                    {
+                        ACPI_HID_DEVICE_PATH acpi_data;
+                        memcpy(&acpi_data, node_data_start, offsetof(ACPI_HID_DEVICE_PATH, CID));
+                        printf("AcpiEx(HID=0x%x,UID=%u)", acpi_data.HID, acpi_data.UID);
+                    }
+                    else if (header.Length >= offsetof(ACPI_HID_DEVICE_PATH, UID))
+                    {
+                        ACPI_HID_DEVICE_PATH acpi_data;
+                        memcpy(&acpi_data, node_data_start, offsetof(ACPI_HID_DEVICE_PATH, UID));
+                        printf("AcpiEx(HID=0x%x)", acpi_data.HID);
+                    }
+                    else
+                    {
+                        printf("AcpiEx(Data too short)");
+                    }
+                }
                 else
+                {
                     printf("Acpi(SubType=0x%02x)", header.SubType);
+                }
                 break;
 
             case MESSAGING_DEVICE_PATH:
-                if (header.SubType == MSG_USB_DP)
-                    printf("Usb(Port?,Interface?)");
-                else if (header.SubType == MSG_SATA_DP)
-                    printf("Sata(Port,Multiplier,Lun)");
-                else if (header.SubType == MSG_NVME_NAMESPACE_DP)
-                    printf("Nvme(NSID,UUID)");
-                else if (header.SubType == MSG_MAC_ADDR_DP)
+                switch (header.SubType)
+                {
+                case MSG_USB_DP:
+                    if (header.Length >= sizeof(USB_DEVICE_PATH))
+                    {
+                        USB_DEVICE_PATH usb_data;
+                        memcpy(&usb_data, node_data_start, sizeof(USB_DEVICE_PATH));
+                        printf("Usb(ParentPort=%u,If=%u)", usb_data.ParentPortNumber, usb_data.InterfaceNumber);
+                    }
+                    else
+                    {
+                        printf("Usb(Data too short)");
+                    }
+                    break;
+                case MSG_SATA_DP:
+                    if (header.Length >= sizeof(SATA_DEVICE_PATH))
+                    {
+                        SATA_DEVICE_PATH sata_data;
+                        memcpy(&sata_data, node_data_start, sizeof(SATA_DEVICE_PATH));
+                        printf("Sata(Port=%u,Multiplier=%u,Lun=%u)", sata_data.HBAPortNumber, sata_data.PortMultiplierPortNumber, sata_data.Lun);
+                    }
+                    else
+                    {
+                        printf("Sata(Data too short)");
+                    }
+                    break;
+                case MSG_NVME_NAMESPACE_DP:
+                    if (header.Length >= sizeof(NVME_NAMESPACE_DEVICE_PATH))
+                    {
+                        NVME_NAMESPACE_DEVICE_PATH nvme_data;
+                        memcpy(&nvme_data, node_data_start, sizeof(NVME_NAMESPACE_DEVICE_PATH));
+                        // Note: NamespaceUuid is EUI-64, print as hex for now
+                        printf("Nvme(NSID=%u,EUI64=0x%016lx)", nvme_data.NamespaceId, nvme_data.NamespaceUuid);
+                    }
+                    else
+                    {
+                        printf("Nvme(Data too short)");
+                    }
+                    break;
+                case MSG_MAC_ADDR_DP:
+                    // MAC address is in payload_start (payload_size bytes)
                     printf("MAC(...)");
-                else if (header.SubType == MSG_IPv4_DP)
+                    break;
+                case MSG_IPv4_DP:
+                    // IPv4 address details in payload
                     printf("IPv4(...)");
-                else if (header.SubType == MSG_IPv6_DP)
+                    break;
+                case MSG_IPv6_DP:
+                    // IPv6 address details in payload
                     printf("IPv6(...)");
-                else if (header.SubType == MSG_URI_DP)
-                    printf("Uri(...)");
-                else
+                    break;
+                case MSG_URI_DP:
+                    // URI string in payload (UTF-8)
+                    if (payload_size > 0)
+                    {
+                        // Ensure null termination for safety, though UEFI spec says it's not null terminated
+                        char *uri_str = malloc(payload_size + 1);
+                        if (uri_str)
+                        {
+                            memcpy(uri_str, payload_start, payload_size);
+                            uri_str[payload_size] = '\0';
+                            printf("Uri(%s)", uri_str);
+                            free(uri_str);
+                        }
+                        else
+                        {
+                            printf("Uri(Mem Alloc Error)");
+                        }
+                    }
+                    else
+                    {
+                        printf("Uri(Empty)");
+                    }
+                    break;
+                default:
                     printf("Msg(SubType=0x%02x)", header.SubType);
+                    break;
+                }
                 break;
 
             case BBS_DEVICE_PATH:
+                // BBS_DEVICE_PATH struct could be added to show DeviceType etc.
                 printf("BBS(Type=0x%02x)", header.SubType);
                 break;
 
@@ -479,7 +778,17 @@ int main(void)
         }
         size_t desc_len_bytes = (desc_len_chars + 1) * sizeof(uint16_t);
 
-        printf("Name: %s\n", utf16le_to_utf8(description_start, desc_len_chars * sizeof(uint16_t)));
+        // Call utf16le_to_utf8 and handle the result
+        char *name_utf8 = utf16le_to_utf8(description_start, desc_len_chars * sizeof(uint16_t));
+        if (name_utf8)
+        {
+            printf("Name: %s\n", name_utf8);
+            free(name_utf8); // Free the allocated memory
+        }
+        else
+        {
+            printf("Name: (Error converting description)\n");
+        }
 
         uint8_t *device_path_start = entry_data + sizeof(uint32_t) + sizeof(uint16_t) + desc_len_bytes;
         size_t device_path_offset = sizeof(uint32_t) + sizeof(uint16_t) + desc_len_bytes;
